@@ -1,112 +1,150 @@
 package com.arpi.rpcamera
 
 import android.Manifest
-import android.app.Activity
 import android.content.pm.PackageManager
-import android.hardware.Camera
 import android.os.Bundle
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.util.Log
+import android.util.Size
 import android.view.View
-import android.widget.Button
 import android.widget.Toast
-import java.nio.file.Files
-import java.nio.file.Paths
-import java.nio.file.StandardOpenOption
+import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.*
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.core.content.ContextCompat
+import kotlinx.android.synthetic.main.main.*
+import java.io.File
+import java.nio.ByteBuffer
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
-class MainActivity: Activity(), SurfaceHolder.Callback {
-    private var mCamera: Camera? = null
-    private lateinit var mSurfaceHolder: SurfaceHolder
-    private lateinit var mCaptureButton: Button
+typealias LumaListener = (luma: Double) -> Unit
+
+class MainActivity: AppCompatActivity() {
+    companion object {
+        private const val TAG = "RpCamera"
+        private val PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+        private const val REQUEST_CODE_1: Int = 1
+    }
+
+    private var preview: Preview? = null
+    private var camera: Camera? = null
+    private var imageCapture: ImageCapture? = null
+    private var imageAnalyzer: ImageAnalysis? = null
+    private lateinit var cameraExecutor: ExecutorService
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         setContentView(R.layout.main)
-        mSurfaceHolder = findViewById<SurfaceView>(R.id.surface).holder
-        mSurfaceHolder.addCallback(this)
 
-        mCaptureButton = findViewById<Button>(R.id.button)
-
-        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            openCamera()
+        if (permissionsGranted()) {
+            startPreview()
         } else {
-            requestPermissions(arrayOf(Manifest.permission.CAMERA), requestCodeCameraPermission)
+            requestPermissions(PERMISSIONS, REQUEST_CODE_1)
         }
+
+        cameraExecutor = Executors.newSingleThreadExecutor()
     }
 
-    private val requestCodeCameraPermission: Int = 1
+    private fun permissionsGranted() = PERMISSIONS.all {
+        checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+    }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>,
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>,
                                             grantResults: IntArray) {
         when(requestCode) {
-            requestCodeCameraPermission -> {
-                if ((grantResults.isNotEmpty() &&
-                            grantResults[0] == PackageManager.PERMISSION_GRANTED)) {
-                    openCamera()
+            REQUEST_CODE_1 -> {
+                if (permissionsGranted()) {
                     startPreview()
+                } else {
+                    Toast.makeText(applicationContext,
+                            "Permissions not granted",
+                            Toast.LENGTH_SHORT).show()
+                    finish()
                 }
             }
         }
     }
 
-
-    private fun openCamera() {
-        mCamera = Camera.open(0)
-        mCamera?.apply {
-            parameters.also { params->
-                params.setPictureSize(640, 480)
-                parameters = params
-            }
-        }
-    }
-
     private fun startPreview() {
-        mCamera?.apply {
-            setPreviewDisplay(mSurfaceHolder)
-            startPreview()
-        }
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener( {
+            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+            preview = Preview.Builder().setTargetResolution(Size(640,480)).build()
+
+            imageCapture = ImageCapture.Builder()
+                    .setTargetResolution(Size(640,480)).build()
+
+            imageAnalyzer = ImageAnalysis.Builder()
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
+                    .also {
+                        it.setAnalyzer(cameraExecutor, LuminosityAnalyzer { luma ->
+                            Log.d(TAG, "Luminosity: $luma")
+                            Thread.sleep(1000)
+                        })
+                    }
+
+            val cameraSelector = CameraSelector.Builder().build()
+            cameraProvider.unbindAll()
+            camera = cameraProvider.bindToLifecycle(
+                    this, cameraSelector, preview, imageCapture, imageAnalyzer)
+            preview!!.setSurfaceProvider(viewFinder.surfaceProvider)
+        }, ContextCompat.getMainExecutor(this))
     }
-
-
-    override fun surfaceCreated(h: SurfaceHolder) {
-        startPreview()
-    }
-
-    override fun surfaceChanged(h: SurfaceHolder, p1: Int, p2: Int, p3: Int) {}
-
-    override fun surfaceDestroyed(h: SurfaceHolder) {
-        mCamera?.stopPreview()
-    }
-
 
     fun onClick(v: View) {
-        mCaptureButton.isClickable = false
-        mCamera?.takePicture(null, null, mPictureCallback)
+        val imageCapture = imageCapture ?: return
+        captureButton.isClickable = false
+
+        val photoFile = File(filesDir,LocalDateTime.now().format(DateTimeFormatter.ofPattern(
+                        "yyMMdd_HHmmss")) + ".jpg")
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+
+        imageCapture.takePicture(outputOptions, ContextCompat.getMainExecutor(this),
+                object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                        val savedPath =
+                        Toast.makeText(applicationContext,
+                                "Captured: " + photoFile.absolutePath,
+                                Toast.LENGTH_LONG).show()
+                        enableCaptureButton(3000)
+                    }
+                    override fun onError(exception: ImageCaptureException) {
+                        Toast.makeText(applicationContext,
+                                "Capture failed: ${exception.message}",
+                                Toast.LENGTH_LONG).show()
+                        enableCaptureButton(3000)
+                    }
+                })
     }
 
-    private val mPictureCallback = object: Camera.PictureCallback {
-        override fun onPictureTaken(data: ByteArray?, cam: Camera?) {
-            val fileName = LocalDateTime.now().format(DateTimeFormatter.ofPattern(
-                    "yyMMdd_HHmmss")) + ".jpg"
-            val filePath = applicationContext.getExternalFilesDir(null)!!.absolutePath +
-                    "/" + fileName
-
-            Files.write(Paths.get(filePath), data,
-                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
-
-            Toast.makeText(applicationContext,
-                    "Captured: /sdcard/Android/data/$packageName/files/" + fileName,
-                    Toast.LENGTH_LONG).show()
-
-            thread {
-                Thread.sleep(4000)
-                mCamera?.startPreview()
-                mCaptureButton.isClickable = true
+    private fun enableCaptureButton(delay:Long) {
+        thread {
+            Thread.sleep(delay)
+            this@MainActivity.runOnUiThread {
+                captureButton.isClickable = true
             }
         }
+    }
+
+    private class LuminosityAnalyzer(private val listener: LumaListener) : ImageAnalysis.Analyzer {
+        private fun ByteBuffer.toByteArray(): ByteArray {
+            rewind()    // Rewind the buffer to zero
+            val data = ByteArray(remaining())
+            get(data)   // Copy the buffer into a byte array
+            return data // Return the byte array
+        }
+        override fun analyze(image: ImageProxy) {
+            val buffer = image.planes[0].buffer
+            val data = buffer.toByteArray()
+            val pixels = data.map { it.toInt() and 0xFF }
+            val luma = pixels.average()
+            image.close()
+
+            listener(luma)
+        }
+
     }
 }
